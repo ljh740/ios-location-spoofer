@@ -798,9 +798,53 @@
       return result;
     }
 
+    var tailKeys = [
+      "debug",
+      "mode",
+      "enabled",
+      "latitude",
+      "longitude",
+      "altitude",
+      "address",
+      "configHost",
+      "configToken",
+      "horizontalAccuracy",
+      "verticalAccuracy",
+      "unknownValue4",
+      "motionActivityType",
+      "motionActivityConfidence",
+      "failOpen",
+      "dumpRaw",
+      "dumpHeaders",
+      "prepareHeaders",
+      "rawLimit"
+    ];
+    var configUrlKey = "configUrl=";
+    var configUrlIdx = argument.indexOf(configUrlKey);
+    if (configUrlIdx >= 0) {
+      var valueStart = configUrlIdx + configUrlKey.length;
+      var tail = argument.slice(valueStart);
+      var end = -1;
+      var i;
+      for (i = 0; i < tailKeys.length; i += 1) {
+        var marker = "&" + tailKeys[i] + "=";
+        var pos = tail.indexOf(marker);
+        if (pos >= 0 && (end < 0 || pos < end)) {
+          end = pos;
+        }
+      }
+      var configUrlValue = end >= 0 ? tail.slice(0, end) : tail;
+      try {
+        result.configUrl = decodeURIComponent(configUrlValue);
+      } catch (err) {
+        result.configUrl = configUrlValue;
+      }
+      argument = argument.slice(0, configUrlIdx) + (end >= 0 ? tail.slice(end + 1) : "");
+    }
+
     var pairs = argument.split(/[&;]/);
-    for (var i = 0; i < pairs.length; i += 1) {
-      var part = pairs[i];
+    for (var j = 0; j < pairs.length; j += 1) {
+      var part = pairs[j];
       if (!part) {
         continue;
       }
@@ -809,11 +853,25 @@
       var value = eq >= 0 ? part.slice(eq + 1) : "true";
       try {
         result[decodeURIComponent(key)] = decodeURIComponent(value);
-      } catch (err) {
+      } catch (err2) {
         result[key] = value;
       }
     }
     return result;
+  }
+
+  function resolveConfigUrl(args) {
+    args = args || {};
+    var direct = String(args.configUrl || args.cfg || args.url || "").trim();
+    if (direct) {
+      return direct;
+    }
+    var host = String(args.configHost || "").trim().replace(/\/+$/, "");
+    var token = String(args.configToken || "").trim();
+    if (host && token) {
+      return host + "/loc.json?token=" + encodeURIComponent(token);
+    }
+    return "";
   }
 
   function readScriptArguments() {
@@ -1074,7 +1132,7 @@
       if (!entry || entry.url !== url || !entry.data) {
         return null;
       }
-      if (Date.now() - entry.ts > 60000) {
+      if (Date.now() - entry.ts > 300000) {
         return null;
       }
       return entry.data;
@@ -1097,23 +1155,32 @@
     }
   }
 
-  function refreshRemoteConfigCache(url, debug) {
+  function fetchRemoteConfig(url, timeout, debug, callback) {
     if (!url || typeof $httpClient === "undefined" || !$httpClient.get) {
+      callback(null, "http client unavailable");
       return;
     }
-    $httpClient.get({ url: url, timeout: 5000 }, function (error, response, body) {
+    $httpClient.get({ url: url, timeout: timeout || 3000 }, function (error, response, body) {
       if (error || !body) {
-        if (debug) {
-          console.log("Location spoofer remote config refresh failed: " + (error || "empty body"));
-        }
+        callback(null, error || "empty body");
         return;
       }
       try {
-        writeRemoteConfigCache(url, JSON.parse(body));
+        callback(JSON.parse(body), null);
       } catch (err) {
-        if (debug) {
-          console.log("Location spoofer remote config refresh parse failed: " + err.message);
-        }
+        callback(null, err.message);
+      }
+    });
+  }
+
+  function refreshRemoteConfigCache(url, debug) {
+    fetchRemoteConfig(url, 5000, debug, function (data, err) {
+      if (data) {
+        writeRemoteConfigCache(url, data);
+        return;
+      }
+      if (debug) {
+        console.log("Location spoofer remote config refresh failed: " + err);
       }
     });
   }
@@ -1142,8 +1209,8 @@
   function loadRuntimeConfigSync() {
     var args = readScriptArguments();
     var cfg = mergeConfig(DEFAULT_CONFIG, configFromArgs(args));
-    var configUrl = args.configUrl || args.cfg || args.url || "";
-    var debug = cfg.debug === true || String(cfg.debug).toLowerCase() === "true";
+    var configUrl = resolveConfigUrl(args);
+    var debug = parseBoolean(cfg.debug, false);
     var address = String(args.address || "").trim();
 
     applyAddressFromCache(cfg, address, debug);
@@ -1152,30 +1219,120 @@
       var remoteCfg = readRemoteConfigCache(configUrl);
       if (remoteCfg) {
         cfg = mergeConfig(cfg, remoteCfg);
-      } else if (debug) {
-        console.log("Location spoofer remote config cache miss: " + configUrl);
+        if (debug) {
+          console.log(
+            "Location spoofer remote config cache hit -> " +
+              remoteCfg.latitude +
+              "," +
+              remoteCfg.longitude
+          );
+        }
       }
-      refreshRemoteConfigCache(configUrl, debug);
     }
 
-    return normalizeConfig(cfg);
+    return { cfg: cfg, configUrl: configUrl, debug: debug };
   }
 
   function loadRuntimeConfig(callback) {
-    callback(loadRuntimeConfigSync());
+    var loaded = loadRuntimeConfigSync();
+    var cfg = loaded.cfg;
+    var configUrl = loaded.configUrl;
+    var debug = loaded.debug;
+
+    function finish() {
+      try {
+        callback(normalizeConfig(cfg));
+      } catch (err) {
+        if (debug) {
+          console.log("Location spoofer config invalid: " + err.message);
+        }
+        callback(
+          normalizeConfig(
+            mergeConfig(DEFAULT_CONFIG, {
+              enabled: cfg.enabled,
+              failOpen: true,
+              debug: debug
+            })
+          )
+        );
+      }
+    }
+
+    if (!configUrl) {
+      finish();
+      return;
+    }
+
+    if (readRemoteConfigCache(configUrl)) {
+      refreshRemoteConfigCache(configUrl, debug);
+      finish();
+      return;
+    }
+
+    if (debug) {
+      console.log("Location spoofer remote config fetching: " + configUrl);
+    }
+    fetchRemoteConfig(configUrl, 3000, debug, function (data, err) {
+      if (data) {
+        writeRemoteConfigCache(configUrl, data);
+        cfg = mergeConfig(cfg, data);
+        if (debug) {
+          console.log(
+            "Location spoofer remote config loaded -> " + data.latitude + "," + data.longitude
+          );
+        }
+      } else if (debug) {
+        console.log("Location spoofer remote config fetch failed: " + err + " (using manual lat/lng)");
+      }
+      finish();
+    });
+  }
+
+  function runMaintenanceCron() {
+    var args = readScriptArguments();
+    var debug = parseBoolean(args.debug, false);
+    var pending = 0;
+
+    function maybeDone() {
+      pending -= 1;
+      if (pending <= 0) {
+        $done({});
+      }
+    }
+
+    var configUrl = resolveConfigUrl(args);
+    if (configUrl) {
+      pending += 1;
+      fetchRemoteConfig(configUrl, 8000, debug, function (data, err) {
+        if (data) {
+          writeRemoteConfigCache(configUrl, data);
+          if (debug) {
+            console.log(
+              "Location spoofer config cron cached -> " + data.latitude + "," + data.longitude
+            );
+          }
+        } else if (debug) {
+          console.log("Location spoofer config cron failed: " + err);
+        }
+        maybeDone();
+      });
+    }
+
+    var address = String(args.address || "").trim();
+    if (address) {
+      pending += 1;
+      geocodeAddress(address, debug, function () {
+        maybeDone();
+      });
+    }
+
+    if (pending === 0) {
+      $done({});
+    }
   }
 
   function runGeocodeCron() {
-    var args = readScriptArguments();
-    var address = String(args.address || "").trim();
-    var debug = parseBoolean(args.debug, false);
-    if (!address) {
-      $done({});
-      return;
-    }
-    geocodeAddress(address, debug, function () {
-      $done({});
-    });
+    runMaintenanceCron();
   }
 
   function headersWithBinaryBody(sourceHeaders, length) {
@@ -1634,6 +1791,16 @@
         }
 
         if (hasResponse) {
+          if (config.debug) {
+            console.log(
+              "Location spoofer intercept -> lat=" +
+                config.latitude +
+                ", lng=" +
+                config.longitude +
+                ", url=" +
+                (($request && $request.url) || "<none>")
+            );
+          }
           if (config.mode === "probe") {
             doneResponseProbe(config);
             return;
